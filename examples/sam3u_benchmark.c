@@ -27,18 +27,42 @@
 #include <stdio.h>
 #include <errno.h>
 #include <signal.h>
+#include <string.h>
+#include <assert.h>
 
 #include <libusb.h>
 
 
 #define EP_DATA_IN	0x82
-#define EP_ISO_IN	0x86
+#define EP_ISO_IN	0x84
+
+/* number of USB transfers to submit concurrently */
+#define NUM_XFER	4
+/* size of each isochronous packet */
+#define SIZE_ISO_PACK	512
+/* number of isochronous packets in one transfer */
+#define NUM_ISO_PACK	8
 
 static int do_exit = 0;
 static struct libusb_device_handle *devh = NULL;
 
 static unsigned long num_bytes = 0, num_xfer = 0;
 static struct timeval tv_start;
+
+static void hexdump(const uint8_t *buf, unsigned int len)
+{
+	unsigned int i;
+
+	for (i = 0; i < len; i++) {
+		printf("%02x", buf[i]);
+		if (i % 32 == 31)
+			printf("\n");
+		else if (i % 8 == 7)
+			printf("  ");
+		else
+			printf(" ");
+	}
+}
 
 static void LIBUSB_CALL cb_xfr(struct libusb_transfer *xfr)
 {
@@ -64,18 +88,25 @@ static void LIBUSB_CALL cb_xfr(struct libusb_transfer *xfr)
 	}
 
 	printf("length:%u, actual_length:%u\n", xfr->length, xfr->actual_length);
-	for (i = 0; i < xfr->actual_length; i++) {
-		printf("%02x", xfr->buffer[i]);
-		if (i % 16)
-			printf("\n");
-		else if (i % 8)
-			printf("  ");
-		else
-			printf(" ");
+	if (xfr->type == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS) {
+		for (i = 0; i < xfr->num_iso_packets; i++) {
+			struct libusb_iso_packet_descriptor *pack = &xfr->iso_packet_desc[i];
+			uint8_t *packbuf;
+
+			if (pack->actual_length == 0)
+				continue;
+
+			packbuf = libusb_get_iso_packet_buffer_simple(xfr, i);
+			hexdump(packbuf, pack->actual_length);
+			num_bytes += pack->actual_length;
+		}
+	} else {
+		hexdump(xfr->buffer, xfr->actual_length);
+		num_bytes += xfr->actual_length;
 	}
-	num_bytes += xfr->actual_length;
 	num_xfer++;
 
+	memset(xfr->buffer, 0, xfr->length);
 	if (libusb_submit_transfer(xfr) < 0) {
 		fprintf(stderr, "error re-submitting URB\n");
 		exit(1);
@@ -84,24 +115,27 @@ static void LIBUSB_CALL cb_xfr(struct libusb_transfer *xfr)
 
 static int benchmark_in(uint8_t ep)
 {
-	static uint8_t buf[2048];
-	static struct libusb_transfer *xfr;
+	unsigned int buf_size = SIZE_ISO_PACK*NUM_ISO_PACK;
+	struct libusb_transfer *xfr;
 	int num_iso_pack = 0;
+	uint8_t *buf;
 
 	if (ep == EP_ISO_IN)
-		num_iso_pack = 16;
+		num_iso_pack = NUM_ISO_PACK;
 
+	buf = malloc(buf_size);
+	assert(buf);
 	xfr = libusb_alloc_transfer(num_iso_pack);
 	if (!xfr)
 		return -ENOMEM;
 
 	if (ep == EP_ISO_IN) {
 		libusb_fill_iso_transfer(xfr, devh, ep, buf,
-				sizeof(buf), num_iso_pack, cb_xfr, NULL, 0);
-		libusb_set_iso_packet_lengths(xfr, sizeof(buf)/num_iso_pack);
+				buf_size, num_iso_pack, cb_xfr, NULL, 0);
+		libusb_set_iso_packet_lengths(xfr, SIZE_ISO_PACK);
 	} else
 		libusb_fill_bulk_transfer(xfr, devh, ep, buf,
-				sizeof(buf), cb_xfr, NULL, 0);
+				buf_size, cb_xfr, NULL, 0);
 
 	gettimeofday(&tv_start, NULL);
 
@@ -148,7 +182,7 @@ static void sig_hdlr(int signum)
 
 int main(int argc, char **argv)
 {
-	int rc;
+	int rc, i;
 	struct sigaction sigact;
 
 	sigact.sa_handler = sig_hdlr;
@@ -162,7 +196,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	devh = libusb_open_device_with_vid_pid(NULL, 0x16c0, 0x0763);
+	devh = libusb_open_device_with_vid_pid(NULL, 0x03eb, 0x2403);
 	if (!devh) {
 		fprintf(stderr, "Error finding USB device\n");
 		goto out;
@@ -173,8 +207,14 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Error claiming interface: %s\n", libusb_error_name(rc));
 		goto out;
 	}
+	rc = libusb_set_interface_alt_setting(devh, 2, 1);
+	if (rc < 0) {
+		fprintf(stderr, "Error switching interface altsetting: %s\n", libusb_error_name(rc));
+		goto out;
+	}
 
-	benchmark_in(EP_ISO_IN);
+	for (i = 0; i < NUM_XFER; i++)
+		benchmark_in(EP_ISO_IN);
 
 	while (!do_exit) {
 		rc = libusb_handle_events(NULL);

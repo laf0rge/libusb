@@ -1,4 +1,5 @@
 AM_CPPFLAGS = -I$(top_srcdir)/libusb
+AM_CFLAGS = -I$(top_srcdir)/libusb
 LDADD = ../libusb/libusb-1.0.la
 
 noinst_PROGRAMS = listdevs xusb fxload hotplugtest testlibusb
